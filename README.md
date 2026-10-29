@@ -20,7 +20,7 @@
 
 Watching a film over a video call means one laptop encodes the film live, uploads it, and runs a call on top. It is slow, it burns battery, and it heats the laptop. couch skips all of that: each browser plays its own copy, and only the play, pause and seek events travel between the two.
 
-You open a room, both of you press **sit down**, and one of you pastes a film link from 1shows.org. The film loads on both sides. When one person pauses or skips, the other person's player reloads at the same second, with a toast saying who did it. When the film ends, you both land on a details page and rate it out of 5 blind, so nobody anchors the other (the argument after is the feature).
+You open a room, both of you press **sit down**, and one of you searches for a film. The film loads on both sides. When one person pauses or skips, the other person's player reloads at the same second, with a toast saying who did it. When the film ends, you both land on a details page and rate it out of 5 blind, so nobody anchors the other (the argument after is the feature).
 
 ```console
 nick@couch:~$ open https://couch.nicktrim.com
@@ -33,7 +33,7 @@ nick@couch:~$ open https://couch.nicktrim.com
 | | feature | what it actually does |
 |---|---|---|
 | 01 | **sit down** | one click per visit, which is also what lets the player autoplay with sound |
-| 02 | **paste to play** | ⌘V a 1shows link anywhere in the room; mid-film it asks before switching |
+| 02 | **search** | type a title in the empty room, pick it, it loads for both (films only, via wikidata, no ads) |
 | 03 | **remote control** | pause, play and seek reload the other player at `startAt`, behind a "syncing to 41:12" curtain |
 | 04 | **the pill** | top right: who is here, the film, the clock, fullscreen; hides after 3 s |
 | 05 | **drift badge** | more than 3 s apart turns the dot magenta with a resync button (no surprise reloads mid-scene) |

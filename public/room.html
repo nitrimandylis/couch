@@ -23,8 +23,12 @@
   </section>
 
   <section class="panel" id="empty" hidden>
-    <p class="paste">Paste a 1shows link<span class="caret"></span></p>
-    <p>Copy a film's address from 1shows.org and press ⌘V here. It loads for both of you.</p>
+    <form class="search" id="search" autocomplete="off">
+      <label class="visually-hidden" for="query">Find a film</label>
+      <input id="query" placeholder="Find a film" spellcheck="false">
+    </form>
+    <ul class="results" id="results"></ul>
+    <p id="search-note">Pick one and it loads for both of you. A 1shows link pasted here works too.</p>
     <p id="last"></p>
   </section>
 

@@ -289,6 +289,39 @@ async function filmDetails(tmdb: string, ctx: ExecutionContext): Promise<Respons
   return res;
 }
 
+// ---------- film search (so nobody has to visit 1shows and its ads) ----------
+
+async function searchFilms(query: string): Promise<Response> {
+  // Wikidata full-text search, limited to items with a TMDB movie id (P4947),
+  // which also keeps out TV series.
+  const q = query.replace(/["\\\s]+/g, " ").trim().slice(0, 80);
+  if (q.length < 2) return Response.json([]);
+  const sparql = `SELECT ?tmdb ?label (MIN(YEAR(?date)) AS ?year) (SAMPLE(?dirLabel) AS ?director) ?ordinal WHERE {
+    SERVICE wikibase:mwapi {
+      bd:serviceParam wikibase:api "Search"; wikibase:endpoint "www.wikidata.org";
+        mwapi:srsearch "${q} haswbstatement:P4947"; mwapi:srlimit "10".
+      ?item wikibase:apiOutputItem mwapi:title. ?ordinal wikibase:apiOrdinal true.
+    }
+    ?item wdt:P4947 ?tmdb.
+    ?item rdfs:label ?label. FILTER(LANG(?label) = "en")
+    OPTIONAL { ?item wdt:P577 ?date }
+    OPTIONAL { ?item wdt:P57 ?d. ?d rdfs:label ?dirLabel. FILTER(LANG(?dirLabel) = "en") }
+  } GROUP BY ?tmdb ?label ?ordinal ORDER BY ?ordinal LIMIT 5`;
+  try {
+    const r = await fetch(`https://query.wikidata.org/sparql?format=json&query=${encodeURIComponent(sparql)}`, { headers: POLITE_UA });
+    const rows = ((await r.json()) as any).results.bindings;
+    const films = rows.map((row: any) => ({
+      id: row.tmdb.value,
+      title: row.label.value,
+      year: row.year ? Number(row.year.value) : null,
+      director: row.director?.value ?? null,
+    }));
+    return Response.json(films, { headers: { "cache-control": "public, max-age=3600" } });
+  } catch {
+    return Response.json([], { status: 502 });
+  }
+}
+
 // ---------- routing ----------
 
 export default {
@@ -303,6 +336,10 @@ export default {
         return room.fetch(req);
       }
       if (parts.length === 2) return env.ASSETS.fetch(new Request(new URL("/room", url), req));
+    }
+
+    if (parts[0] === "api" && parts[1] === "search") {
+      return searchFilms(url.searchParams.get("q") ?? "");
     }
 
     if (parts[0] === "api" && parts[1] === "film" && /^\d+$/.test(parts[2] ?? "")) {

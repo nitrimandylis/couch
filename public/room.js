@@ -34,6 +34,7 @@ let quietUntil = 0; // ignore player events until this time (echoes of our own r
 let lagEstimate = 3; // seconds a playing reload takes, refined after every reload
 let measuring = false; // waiting for the first playback after a reload to refine lagEstimate
 
+let lastTick = null; // { time, at } of the previous timeupdate, for spotting seeks
 let peerPos = null; // { name, time, playing, at } from the other browser
 let pendingFilm = null; // film waiting for the "switch?" confirm
 let sendTimer = null;
@@ -132,6 +133,7 @@ function applyState(msg) {
     $("player").src = "about:blank";
     renderEmpty();
     show("empty");
+    $("query").focus();
     return;
   }
 
@@ -193,6 +195,7 @@ function reload(target, playing) {
   player.time = target;
   player.timeAt = Date.now();
   player.playing = false;
+  lastTick = null; // the jump to startAt is not someone seeking
 
   $("curtain-time").textContent = clock(target);
   const line = $("curtain-line");
@@ -218,6 +221,9 @@ function settle() {
   clearTimeout(settleTimer);
   quietUntil = Date.now() + 1500;
   hideCurtain();
+  // vidlink forces mute whenever it autoplays, and only a click inside the
+  // player can unmute it.
+  if (loadPlaying) toast("The player starts muted. Click its speaker icon, bottom left.", 6000);
 }
 
 window.addEventListener("message", (event) => {
@@ -271,12 +277,28 @@ window.addEventListener("message", (event) => {
     send({ type: "ended" });
     return;
   }
+
+  // A seek is a jump between two time reports that playback can't explain.
+  // The "seeked" event itself is useless: JW sends it before the jump, with
+  // the old time. Comparing against our own last report (not the room clock)
+  // means a seat that loaded late never mistakes its lag for a seek.
+  let jumped = false;
+  if (event_ === "timeupdate") {
+    if (lastTick) {
+      const wall = (Date.now() - lastTick.at) / 1000;
+      const moved = player.time - lastTick.time;
+      const allowed = player.playing ? wall + 2 : 2; // paused players shouldn't move at all
+      jumped = moved > allowed || moved < -2;
+    }
+    lastTick = { time: player.time, at: Date.now() };
+  }
+
   if (Date.now() < quietUntil) return;
   // A play while the room already plays is the player starting after a
   // buffer, not a person. Same for a pause while the room is paused.
   if (event_ === "play" && room.playing) return;
   if (event_ === "pause" && !room.playing) return;
-  if (event_ === "play" || event_ === "pause" || event_ === "seeked") {
+  if (event_ === "play" || event_ === "pause" || jumped) {
     wake();
     // Seeking fires pause/seeked/play in a burst; send only where it settles.
     clearTimeout(sendTimer);
@@ -377,12 +399,12 @@ $("fullscreen").addEventListener("click", () => {
 
 let toastTimer = null;
 
-function toast(text) {
+function toast(text, ms = 2600) {
   const el = $("toast");
   el.textContent = text;
   el.classList.remove("gone");
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.add("gone"), 2600);
+  toastTimer = setTimeout(() => el.classList.add("gone"), ms);
 }
 
 // ---------- gate ----------
@@ -426,14 +448,75 @@ function renderEmpty() {
   }
 }
 
+// Search runs through our Worker (Wikidata), so nobody has to open 1shows.
+let searchTimer = null;
+let searchResults = [];
+
+$("query").addEventListener("input", () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(runSearch, 250);
+});
+
+$("search").addEventListener("submit", (event) => {
+  event.preventDefault();
+  if (searchResults.length) pickFilm(searchResults[0]);
+});
+
+async function runSearch() {
+  const query = $("query").value.trim();
+  if (query.length < 2) {
+    showResults([]);
+    return;
+  }
+  let films = [];
+  try {
+    films = await (await fetch("/api/search?q=" + encodeURIComponent(query))).json();
+  } catch {
+    $("search-note").textContent = "Search isn't answering. A pasted 1shows link still works.";
+    return;
+  }
+  if ($("query").value.trim() !== query) return; // a newer search is on its way
+  showResults(films);
+  $("search-note").textContent = films.length ? "Enter picks the first one." : "No films found for that. Try the original title.";
+}
+
+function showResults(films) {
+  searchResults = films;
+  const list = $("results");
+  list.innerHTML = "";
+  films.forEach((film, index) => {
+    const item = document.createElement("li");
+    const button = document.createElement("button");
+    if (index === 0) button.classList.add("first");
+    const title = document.createElement("span");
+    title.className = "title";
+    title.textContent = film.title;
+    const meta = document.createElement("span");
+    meta.className = "meta";
+    meta.textContent = [film.year, film.director].filter(Boolean).join(", ");
+    button.append(title, meta);
+    button.addEventListener("click", () => pickFilm(film));
+    item.append(button);
+    list.append(item);
+  });
+}
+
+function pickFilm(film) {
+  $("query").value = "";
+  showResults([]);
+  send({ type: "load", id: String(film.id), title: film.title });
+}
+
 document.addEventListener("paste", (event) => {
   if (!seated) return;
   const text = event.clipboardData.getData("text");
   const match = text.match(/1shows\.[a-z]+\/movies\/(\d+)(?:-([a-z0-9-]+))?/i);
   if (!match) {
+    if (event.target === $("query")) return; // pasting a title into the search box
     toast("That isn't a 1shows film link");
     return;
   }
+  event.preventDefault();
   const film = { id: match[1], title: match[2] ? titleFromSlug(match[2]) : "Film " + match[1] };
   if (room && room.film && !room.ended && room.film.id !== film.id) {
     // Mid-film: ask before replacing what is playing.

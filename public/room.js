@@ -1,11 +1,13 @@
 // couch room: one vidlink player per browser, kept in step by a tiny relay.
-// vidlink tells us what its player does (postMessage events) but takes no
-// commands, so to move someone's player we reload it with ?startAt=<seconds>.
+// The player page is served from couch's screen subdomain with
+// /couch-screen.js injected, so we can command it (play, pause, seek, unmute)
+// and it can't open ad pop-ups. Loading a film still means loading the page
+// with ?startAt=<seconds>; everything after that is a command.
 
-const VIDLINK = "https://vidlink.pro";
+const SCREEN = location.hostname === "localhost" ? "http://localhost:8788" : "https://screen.couch.nicktrim.com";
 const DRIFT_LIMIT = 3; // seconds apart before the pill turns magenta
 const CURTAIN_CAP = 6000; // ms before the curtain lifts on its own
-const SETTLE_CAP = 12000; // ms before we stop waiting for a reload to land
+const SETTLE_CAP = 12000; // ms before we stop waiting for a film page to land
 
 const roomId = location.pathname.split("/")[2];
 const $ = (id) => document.getElementById(id);
@@ -24,15 +26,14 @@ let peers = [];
 // What our own player last reported.
 const player = { filmId: null, time: 0, timeAt: 0, duration: 0, playing: false };
 
-// Reload bookkeeping.
+// Load and command bookkeeping.
 let loading = false;
 let loadTarget = 0;
-let loadPlaying = false;
 let capTimer = null;
 let settleTimer = null;
-let quietUntil = 0; // ignore player events until this time (echoes of our own reload)
-let lagEstimate = 3; // seconds a playing reload takes, refined after every reload
-let measuring = false; // waiting for the first playback after a reload to refine lagEstimate
+let quietUntil = 0; // ignore player events until this time (echoes of our own commands)
+let lagEstimate = 1; // seconds a seek-and-play takes to get going, refined each time
+let measuring = false; // waiting for the first playback after a command to refine lagEstimate
 
 let lastTick = null; // { time, at } of the previous timeupdate, for spotting seeks
 let peerPos = null; // { name, time, playing, at } from the other browser
@@ -114,7 +115,7 @@ function onServer(msg) {
     updatePill();
   } else if (msg.type === "pull") {
     // The other person is ahead and asked us to jump to them.
-    reload(msg.time + (msg.playing ? lagEstimate : 0), msg.playing);
+    goTo(msg.time + (msg.playing ? lagEstimate : 0), msg.playing);
     toast(msg.name + " pulled you to " + clock(msg.time));
   }
 }
@@ -153,9 +154,9 @@ function applyState(msg) {
   const moved = ["play", "pause", "seek"].includes(msg.action);
 
   if (filmChanged) {
-    reload(roomTime() + (room.playing ? lagEstimate : 0), room.playing);
+    load();
   } else if (moved && !fromMe) {
-    reload(roomTime() + (room.playing ? lagEstimate : 0), room.playing);
+    follow();
   }
 
   if (!fromMe && msg.by) {
@@ -169,27 +170,27 @@ function applyState(msg) {
 
 // ---------- the player ----------
 
-function reload(target, playing) {
+// Load the film's player page, paused at where the room is. Paused, because
+// vidlink mutes the player whenever it autoplays; once it lands, follow()
+// starts it with a command, which keeps the sound on.
+function load() {
   // Always pass startAt, and above 1 (vidlink ignores 0 and 1): without it the
   // player resumes wherever this browser last stopped, not where the room is.
-  target = Math.max(2, Math.floor(target));
+  const target = Math.max(2, Math.floor(roomTime()));
   loading = true;
   loadTarget = target;
-  loadPlaying = playing;
 
-  // JW mode: vidlink's default player restores its own saved time over
-  // startAt, which would undo every remote seek. The JW player honours startAt.
   const params = new URLSearchParams({
-    player: "jw",
-    autoplay: String(playing),
+    player: "jw", // vidlink's default player restores its own saved time over startAt
+    autoplay: "false",
+    startAt: String(target),
     primaryColor: "3DF5FF",
     secondaryColor: "1B2A3A",
     iconColor: "E8F1F5",
     title: "false",
     poster: "true",
   });
-  params.set("startAt", String(target));
-  $("player").src = VIDLINK + "/movie/" + room.film.id + "?" + params;
+  $("player").src = SCREEN + "/movie/" + room.film.id + "?" + params;
   if (player.filmId !== room.film.id) player.duration = 0;
   player.filmId = room.film.id;
   player.time = target;
@@ -203,11 +204,38 @@ function reload(target, playing) {
   $("curtain").classList.remove("gone");
   clearTimeout(capTimer);
   clearTimeout(settleTimer);
-
   // The curtain gives up after 6 s, but we keep ignoring the player's own
   // events until it lands, or a slow load would be mistaken for someone seeking.
   capTimer = setTimeout(hideCurtain, CURTAIN_CAP);
   settleTimer = setTimeout(settle, SETTLE_CAP);
+}
+
+// Move our player to where the room is now.
+function follow() {
+  goTo(roomTime() + (room.playing ? lagEstimate : 0), room.playing);
+}
+
+function goTo(target, playing) {
+  if (loading) return; // settle() calls follow() once the page has landed
+  target = Math.max(0, target);
+  quietUntil = Date.now() + 2000; // the player's echoes of this command
+  lastTick = null;
+  loadTarget = target;
+  measuring = playing;
+  player.time = target;
+  player.timeAt = Date.now();
+  command({ seek: target, play: playing, unmute: true });
+  // Chrome lets the room start the player because of the "sit down" click.
+  // If it ever refuses, say so instead of sitting there paused.
+  if (playing) {
+    setTimeout(() => {
+      if (room && room.playing && !player.playing && !loading) toast("Press play in the player: the browser didn't let couch start it.", 5000);
+    }, 3000);
+  }
+}
+
+function command(cmd) {
+  $("player").contentWindow.postMessage({ type: "COUCH_COMMAND", ...cmd }, SCREEN);
 }
 
 function hideCurtain() {
@@ -219,15 +247,12 @@ function settle() {
   loading = false;
   clearTimeout(capTimer);
   clearTimeout(settleTimer);
-  quietUntil = Date.now() + 1500;
   hideCurtain();
-  // vidlink forces mute whenever it autoplays, and only a click inside the
-  // player can unmute it.
-  if (loadPlaying) toast("The player starts muted. Click its speaker icon, bottom left.", 6000);
+  follow(); // catch up with the room: it may have moved, or be playing, while we loaded
 }
 
 window.addEventListener("message", (event) => {
-  if (event.origin !== VIDLINK) return;
+  if (event.origin !== SCREEN) return;
   let data = event.data;
   if (typeof data === "string") {
     try {
@@ -254,23 +279,22 @@ window.addEventListener("message", (event) => {
   updateClock();
 
   if (loading) {
-    // The reload has landed when vidlink finishes its own jump to startAt
+    // The page has landed when vidlink finishes its own jump to startAt
     // (seeked), or reports a time near where we sent it.
     const near = Math.abs(player.time - loadTarget) < 3;
     const landed = event_ === "seeked" || (event_ === "timeupdate" && near);
     if (landed) {
-      measuring = loadPlaying;
       settle();
     }
     return;
   }
 
-  // First real playback after a playing reload: how far behind the room did
+  // First real playback after a play command: how far behind the room did
   // we land? Add that to the guess for next time.
   if (measuring && event_ === "timeupdate" && player.playing && player.time > loadTarget + 0.5) {
     measuring = false;
     const behind = roomTime() - player.time;
-    lagEstimate = Math.min(10, Math.max(1, lagEstimate + behind));
+    lagEstimate = Math.min(5, Math.max(0, lagEstimate + behind));
   }
 
   if (event_ === "ended") {
@@ -377,7 +401,7 @@ $("resync").addEventListener("click", () => {
   if (drift < 0) {
     // We are behind: jump ourselves to them.
     const theirs = peerPos.time + (peerPos.playing ? (Date.now() - peerPos.at) / 1000 : 0);
-    reload(theirs + (peerPos.playing ? lagEstimate : 0), peerPos.playing);
+    goTo(theirs + (peerPos.playing ? lagEstimate : 0), peerPos.playing);
   } else {
     // They are behind: pull them to us.
     send({ type: "pull", time: myTime(), playing: player.playing });

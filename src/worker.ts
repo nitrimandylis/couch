@@ -322,11 +322,71 @@ async function searchFilms(query: string): Promise<Response> {
   }
 }
 
+// ---------- the screen: vidlink's player page, served from our own subdomain ----------
+// vidlink's player takes no commands and opens ad pop-ups on clicks. Serving its
+// page from a couch subdomain lets us inject /couch-screen.js into it, which
+// blocks the pop-ups and drives the JW player on behalf of the room page.
+// Only the page, its scripts and its API go through here; the video file
+// itself streams straight from vidlink's host to the browser.
+
+const SCREEN_HOSTS = ["screen.couch.nicktrim.com"];
+
+async function screen(req: Request, env: Env, url: URL): Promise<Response> {
+  if (url.pathname === "/couch-screen.js") return env.ASSETS.fetch(req);
+  // vidlink's page fetches its pop-up ad libraries from these two (PopAds and
+  // Adcash). Answering with nothing means they never load.
+  if (url.pathname === "/api/venus" || url.pathname === "/api/mercury") return new Response("", { status: 200 });
+
+  const headers = new Headers(req.headers);
+  headers.delete("host");
+  headers.delete("cookie");
+  headers.set("accept-encoding", "gzip"); // the Worker can only rewrite what it can decode
+  headers.set("origin", "https://vidlink.pro");
+  headers.set("referer", "https://vidlink.pro" + url.pathname);
+  // The page tells vidlink's API what the browser can play. Chrome says
+  // "dash-hevc" and gets a DASH stream from a host that refuses any origin but
+  // vidlink's. "standard" gets plain MP4 files, which play from anywhere.
+  if (url.pathname.startsWith("/api/b/")) headers.set("x-playback-environment", "standard");
+  const upstream = await fetch("https://vidlink.pro" + url.pathname + url.search, {
+    method: req.method,
+    headers,
+    body: req.method === "GET" || req.method === "HEAD" ? undefined : req.body,
+    redirect: "manual",
+  });
+
+  // The API flags every MP4 as needing vidlink's relay host, which refuses any
+  // origin but vidlink's. The files themselves play directly with no referrer,
+  // so clear the flag and the page uses the direct links.
+  if (url.pathname.startsWith("/api/b/") && upstream.ok) {
+    const data = (await upstream.json()) as any;
+    for (const quality of Object.values(data?.stream?.qualities ?? {}) as any[]) {
+      if (quality.type === "mp4") quality.requiresProxy = false;
+    }
+    return Response.json(data, { headers: { "cache-control": "no-store" } });
+  }
+
+  const response = new Response(upstream.body, upstream);
+  response.headers.delete("content-security-policy");
+  response.headers.delete("x-frame-options");
+  response.headers.delete("set-cookie");
+  if (!(upstream.headers.get("content-type") ?? "").includes("text/html")) return response;
+
+  // No referrer: the video host answers 429 to anything but an empty one.
+  return new HTMLRewriter()
+    .on("head", {
+      element(head) {
+        head.prepend('<meta name="referrer" content="no-referrer"><script src="/couch-screen.js"></script>', { html: true });
+      },
+    })
+    .transform(response);
+}
+
 // ---------- routing ----------
 
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(req.url);
+    if (SCREEN_HOSTS.includes(url.host)) return screen(req, env, url);
     const parts = url.pathname.split("/").filter(Boolean);
 
     if (parts[0] === "r" && parts[1] && ROOM_ID.test(parts[1])) {

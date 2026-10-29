@@ -5,10 +5,15 @@ Watch a film together from two places, in sync, without screen sharing.
 ## What it is
 
 Two people open the same bookmarked room at couch.nicktrim.com. Each browser
-plays its own copy of the film from vidlink's embed, so nothing is encoded or
-uploaded and laptops stay cool. A Cloudflare Durable Object relays play,
-pause and seek between the two. When one person acts, the other person's
-player reloads at the right second.
+plays its own copy of the film, so nothing is encoded or uploaded and laptops
+stay cool. A Cloudflare Durable Object relays play, pause and seek between
+the two. When one person acts, couch commands the other person's player to
+the same second: no reload, no mute.
+
+The player is vidlink's page, served from screen.couch.nicktrim.com through
+the Worker with /couch-screen.js injected. That script blocks pop-ups and
+takes play, pause, seek and unmute commands from the room page. The video
+file streams straight from vidlink's file host, never through couch.
 
 Voice stays outside the app: an audio-only call, with headphones on.
 
@@ -25,8 +30,13 @@ Voice stays outside the app: an audio-only call, with headphones on.
 
 ## Decisions that matter
 
-- vidlink takes no commands, only reports events, so remote control works by
-  reloading the iframe with `startAt`.
+- The screen proxy: refuses vidlink's ad libraries (`/api/venus` is PopAds,
+  `/api/mercury` is Adcash), forces `X-Playback-Environment: standard` on the
+  API (Chrome would otherwise get a DASH stream from a relay host that refuses
+  every origin but vidlink's) and clears `requiresProxy` on the MP4s so the
+  page uses the direct links, which play with no referrer (a referrer gets 429).
+- A film still loads by page load with `startAt`, always paused (vidlink mutes
+  anything it autoplays), then `follow()` starts it with a command.
 - vidlink runs in JW mode (`player=jw`): its default player restores its own
   saved time over `startAt`. `startAt` is always at least 2, because vidlink
   ignores 0 and 1.
@@ -48,19 +58,15 @@ Voice stays outside the app: an audio-only call, with headphones on.
   Safari only plays `hvc1`, and Firefox/Zen has no H.265 on macOS, so both
   fail with JW error 241001. The gate warns when the browser can't decode it.
 
-- vidlink opens betting-ad pop-ups on the first clicks inside its player.
-  An ad blocker on either laptop removes them.
-- Each remote action costs the other person a 2-5 s reload.
-- vidlink forces mute whenever it autoplays, so after the other person
-  presses play or seeks, your player resumes muted and you click its speaker.
-  Fixing that needs direct control of the player (see below).
+- The screen depends on vidlink's internals (the API flag, the header, the
+  ad endpoints). When vidlink changes them, the player breaks or the ads
+  come back, and the proxy needs updating.
+- Chrome must allow the room to start the player (the "sit down" click
+  does this). If it ever refuses, a toast asks you to press play.
 - Not tested in real Chrome or Safari with two people yet; headless tests
   covered the relay, reloads, toasts, drift and the end page.
 
 ## Where it is headed
 
-- Direct player control, by serving vidlink's player page from couch's own
-  origin: no reloads, no forced mute, ads stripped. Blocked in part because
-  vidlink's DASH streams refuse other origins (403); MP4 sources play.
 - Season and episode picker for TV, if they start watching series.
 - A shared history of finished films, from the ratings already stored.

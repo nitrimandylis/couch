@@ -34,7 +34,8 @@ nick@couch:~$ open https://couch.nicktrim.com
 |---|---|---|
 | 01 | **sit down** | one click per visit, which is also what lets the player autoplay with sound |
 | 02 | **search** | type a title in the empty room, pick it, it loads for both (films only, via wikidata, no ads) |
-| 03 | **remote control** | pause, play and seek reload the other player at `startAt`, behind a "syncing to 41:12" curtain |
+| 03 | **remote control** | pause, play and seek command the other player directly: no reload, no mute |
+| 03b | **no pop-ups** | the player page is served through couch with its ad libraries refused and `window.open` disabled |
 | 04 | **the pill** | top right: who is here, the film, the clock, fullscreen; hides after 3 s |
 | 05 | **drift badge** | more than 3 s apart turns the dot magenta with a resync button (no surprise reloads mid-scene) |
 | 06 | **after the film** | backdrop, synopsis, director, runtime, then a blind 1 to 5 rating revealed when both have picked |
@@ -64,7 +65,7 @@ flowchart LR
     RB -- reload with startAt --> B[seat B: vidlink iframe]
 ```
 
-vidlink's player reports what it does over `postMessage` but takes no commands, so moving someone means reloading their iframe at `?startAt=<seconds>`. It runs in JW mode (`player=jw`) because the default player restores its own saved time over `startAt`. A player event only counts as a person if it changes the room: a `play` while the room already plays is a buffer ending, not someone pressing play.
+vidlink's player reports what it does over `postMessage` but takes no commands, so couch serves vidlink's page from `screen.couch.nicktrim.com` through the Worker and injects `couch-screen.js`, which drives the JW player and blocks pop-ups. The video file still streams straight from vidlink's host. It runs in JW mode (`player=jw`) because the default player restores its own saved time over `startAt`. A player event only counts as a person if it changes the room: a `play` while the room already plays is a buffer ending, not someone pressing play.
 
 | file | path | job |
 |---|---|---|

@@ -43,6 +43,11 @@ Voice stays outside the app: an audio-only call, with headphones on.
 
 ## Known limits
 
+- Use a Chromium browser (Chrome, Edge, Brave, Arc) on both ends. vidlink
+  serves most films as H.265 MP4s tagged `hev1`, every quality included.
+  Safari only plays `hvc1`, and Firefox/Zen has no H.265 on macOS, so both
+  fail with JW error 241001. The gate warns when the browser can't decode it.
+
 - vidlink opens betting-ad pop-ups on the first clicks inside its player.
   An ad blocker on either laptop removes them.
 - Each remote action costs the other person a 2-5 s reload.

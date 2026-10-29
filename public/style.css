@@ -111,6 +111,14 @@ button { cursor: pointer; }
 .panel p { margin: 0; max-width: 34ch; color: var(--mute); }
 .panel .lead { color: var(--ink); font-size: 20px; }
 
+.panel .warning {
+  max-width: 44ch;
+  padding: 12px 18px;
+  border: 1px solid rgba(232, 241, 245, 0.22);
+  border-radius: 12px;
+  color: var(--ink);
+}
+
 .name {
   display: grid;
   gap: 8px;

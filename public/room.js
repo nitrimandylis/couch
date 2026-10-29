@@ -415,6 +415,11 @@ function renderGate() {
   $("gate-peer").textContent = other ? other.name + " is already here." : "";
 }
 
+// vidlink serves most films as H.265 MP4s tagged "hev1". Safari only plays
+// "hvc1" and Firefox (Zen) has no H.265 on macOS, so warn before sitting down.
+const testVideo = document.createElement("video");
+$("codec-warning").hidden = testVideo.canPlayType('video/mp4; codecs="hev1.1.6.L93.B0"') !== "";
+
 $("name-field").hidden = !!me.name;
 $("name").value = me.name;
 

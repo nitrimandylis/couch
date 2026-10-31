@@ -52,6 +52,7 @@ cine.send({ type: "source", film, url: "https://evil.example.com/x" });
 b.send({ type: "set", playing: true, time: 0 });
 const played = await a.next((m) => m.type === "state" && m.action === "play");
 ok(played.state.playing === true && played.by === "Guest", "play is relayed with a name");
+ok(played.state.src.url === tunnel, "a source URL that isn't a quick tunnel is refused");
 
 // The source drops: the film holds, paused. It comes back: same place.
 cine.ws.close();

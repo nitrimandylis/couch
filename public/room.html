@@ -20,23 +20,19 @@
     </div>
     <button class="sign" id="sit">sit down</button>
     <p id="gate-peer"></p>
-    <p class="warning" id="codec-warning" hidden>This browser can't play most of these films: they come as H.265 video, which only Chrome, Edge, Brave and Arc decode. Open this room in one of those.</p>
   </section>
 
   <section class="panel" id="empty" hidden>
-    <form class="search" id="search" autocomplete="off">
-      <label class="visually-hidden" for="query">Find a film</label>
-      <input id="query" placeholder="Find a film" spellcheck="false">
-    </form>
-    <ul class="results" id="results"></ul>
-    <p id="search-note">Pick one and it loads for both of you. A 1shows link pasted here works too.</p>
+    <p class="nothing-on">Nothing on yet</p>
+    <p>Start a film on the host's Mac with <code>cine couch</code>. It appears here for both of you.</p>
     <p id="last"></p>
   </section>
 
   <section class="stage" id="stage" hidden>
-    <!-- No allowfullscreen: our own button fullscreens the page, so the pill survives. -->
-    <iframe id="player" title="Film player" allow="autoplay; encrypted-media; picture-in-picture" referrerpolicy="origin"></iframe>
-    <div class="hover-strip" id="strip"></div>
+    <!-- The video's own fullscreen is hidden: ours fullscreens the page, so the pill survives. -->
+    <video id="player" controls controlslist="nofullscreen nodownload noremoteplayback" disablepictureinpicture playsinline crossorigin="anonymous">
+      <track id="subs" kind="subtitles" srclang="en" label="English">
+    </video>
 
     <div class="pill asleep" id="pill">
       <span class="dot" id="dot"></span>
@@ -44,22 +40,15 @@
       <button class="resync" id="resync" hidden>Resync</button>
       <span class="film" id="pill-film"></span>
       <span class="time" id="clock"></span>
+      <button class="cc" id="cc" aria-label="English subtitles" aria-pressed="false" hidden>CC</button>
       <button class="icon-button" id="fullscreen" aria-label="Fullscreen">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 6V2h4M10 2h4v4M14 10v4h-4M6 14H2v-4"/></svg>
       </button>
     </div>
 
     <div class="curtain gone" id="curtain">
-      <p>Syncing to <span class="time" id="curtain-time"></span></p>
+      <p id="curtain-text"></p>
       <div class="line" id="curtain-line"></div>
-    </div>
-
-    <div class="confirm" id="confirm" hidden>
-      <p id="confirm-text"></p>
-      <div class="row">
-        <button class="quiet-button primary" id="confirm-yes">Switch</button>
-        <button class="quiet-button" id="confirm-no">Keep watching</button>
-      </div>
     </div>
 
     <div class="toast gone" id="toast"></div>

@@ -1,16 +1,17 @@
-// couch room: one vidlink player per browser, kept in step by a tiny relay.
-// The player page is served from couch's screen subdomain with
-// /couch-screen.js injected, so we can command it (play, pause, seek, unmute)
-// and it can't open ad pop-ups. Loading a film still means loading the page
-// with ?startAt=<seconds>; everything after that is a command.
+// couch room: both browsers play the same MP4 in a plain <video>, streamed from
+// the host's Mac by `cine couch`. A tiny relay keeps play, pause and seek in step.
+//
+// One rule decides what counts as a person acting: a media event is only sent
+// to the room when it disagrees with the room. A "play" while the room plays,
+// or a seek that lands where the room is, is just us following.
 
-const SCREEN = location.hostname === "localhost" ? "http://localhost:8788" : "https://screen.couch.nicktrim.com";
 const DRIFT_LIMIT = 3; // seconds apart before the pill turns magenta
-const CURTAIN_CAP = 6000; // ms before the curtain lifts on its own
-const SETTLE_CAP = 12000; // ms before we stop waiting for a film page to land
+const CURTAIN_CAP = 10000; // ms before the loading curtain gives up and lifts
+const SEEK_LEAD = 1.5; // seconds: a jump while playing re-buffers through the tunnel, so land ahead
 
 const roomId = location.pathname.split("/")[2];
 const $ = (id) => document.getElementById(id);
+const video = $("player");
 
 // Who this browser is. The id survives renames; the name is what toasts show.
 if (!localStorage.couchId) localStorage.couchId = crypto.randomUUID();
@@ -23,28 +24,15 @@ let raters = []; // browser ids that have rated, from the server
 let clockOffset = 0; // server clock minus our clock, in ms
 let peers = [];
 
-// What our own player last reported.
-const player = { filmId: null, time: 0, timeAt: 0, duration: 0, playing: false };
-
-// Load and command bookkeeping.
-let loading = false;
-let loadTarget = 0;
-let capTimer = null;
-let settleTimer = null;
-let quietUntil = 0; // ignore player events until this time (echoes of our own commands)
-let lagEstimate = 1; // seconds a seek-and-play takes to get going, refined each time
-let measuring = false; // waiting for the first playback after a command to refine lagEstimate
-
-let lastTick = null; // { time, at } of the previous timeupdate, for spotting seeks
+let playing = null; // the source we attached: { key, url, subs }
 let peerPos = null; // { name, time, playing, at } from the other browser
-let pendingFilm = null; // film waiting for the "switch?" confirm
 let sendTimer = null;
-const backdrops = {}; // tmdb id -> backdrop path, from vidlink's MEDIA_DATA
+let capTimer = null;
 
 // ---------- small helpers ----------
 
 function clock(seconds) {
-  seconds = Math.max(0, Math.floor(seconds));
+  seconds = Math.max(0, Math.floor(seconds || 0));
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
   const s = seconds % 60;
@@ -67,23 +55,8 @@ function roomTime() {
   return room.time + (Date.now() + clockOffset - room.at) / 1000;
 }
 
-// Where our own player is right now. vidlink reports about once a second, so
-// we fill the gap, but never by more than 1.5 s: a stalled player must look stalled.
-function myTime() {
-  if (!player.playing) return player.time;
-  return player.time + Math.min(1.5, (Date.now() - player.timeAt) / 1000);
-}
-
 function otherPeer() {
   return peers.find((p) => p.id !== me.id) || null;
-}
-
-// "Fight Club" from "/movies/550-fight-club".
-function titleFromSlug(slug) {
-  return slug
-    .split("-")
-    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
-    .join(" ");
 }
 
 // ---------- connection ----------
@@ -115,12 +88,12 @@ function onServer(msg) {
     updatePill();
   } else if (msg.type === "pull") {
     // The other person is ahead and asked us to jump to them.
-    goTo(msg.time + (msg.playing ? lagEstimate : 0), msg.playing);
+    video.currentTime = msg.time;
     toast(msg.name + " pulled you to " + clock(msg.time));
   }
 }
 
-function applyState(msg) {
+async function applyState(msg) {
   room = msg.state;
   raters = msg.raters || [];
 
@@ -130,17 +103,14 @@ function applyState(msg) {
   }
 
   if (!room.film) {
-    player.filmId = null;
-    $("player").src = "about:blank";
+    detach();
     renderEmpty();
     show("empty");
-    $("query").focus();
     return;
   }
 
   if (room.ended) {
-    $("player").src = "about:blank";
-    player.filmId = null;
+    detach();
     renderAfter();
     show("after");
     return;
@@ -149,13 +119,18 @@ function applyState(msg) {
   show("stage");
   $("pill-film").textContent = room.film.title;
 
-  const fromMe = msg.byId === me.id;
-  const filmChanged = player.filmId !== room.film.id;
-  const moved = ["play", "pause", "seek"].includes(msg.action);
+  if (!room.src) {
+    // cine couch stopped (Ctrl-C, sleep, lost signal). Hold where we are.
+    video.pause();
+    curtain("The film's source went offline. It comes back when cine couch is running again on the host's Mac.");
+    return;
+  }
 
-  if (filmChanged) {
-    load();
-  } else if (moved && !fromMe) {
+  const fromMe = msg.byId === me.id;
+  if (!playing || playing.key !== room.src.url) {
+    await attach();
+    follow();
+  } else if (["play", "pause", "seek"].includes(msg.action) && !fromMe) {
     follow();
   }
 
@@ -163,181 +138,112 @@ function applyState(msg) {
     if (msg.action === "play") toast(msg.by + " pressed play at " + clock(room.time));
     if (msg.action === "pause") toast(msg.by + " paused at " + clock(room.time));
     if (msg.action === "seek") toast(msg.by + " jumped to " + clock(room.time));
-    if (msg.action === "load") toast(msg.by + " put on " + room.film.title);
   }
+  if (msg.action === "load") toast(room.film.title + " is on");
   wake();
 }
 
 // ---------- the player ----------
 
-// Load the film's player page, paused at where the room is. Paused, because
-// vidlink mutes the player whenever it autoplays; once it lands, follow()
-// starts it with a command, which keeps the sound on.
-function load() {
-  // Always pass startAt, and above 1 (vidlink ignores 0 and 1): without it the
-  // player resumes wherever this browser last stopped, not where the room is.
-  const target = Math.max(2, Math.floor(roomTime()));
-  loading = true;
-  loadTarget = target;
+// Everyone, the host included, streams through the tunnel: a public page
+// reaching this Mac's own 127.0.0.1 makes Chrome ask for local network access.
+async function attach() {
+  const { url, subs } = room.src;
+  playing = { key: url, url, subs };
 
-  const params = new URLSearchParams({
-    player: "jw", // vidlink's default player restores its own saved time over startAt
-    autoplay: "false",
-    startAt: String(target),
-    primaryColor: "3DF5FF",
-    secondaryColor: "1B2A3A",
-    iconColor: "E8F1F5",
-    title: "false",
-    poster: "true",
-  });
-  $("player").src = SCREEN + "/movie/" + room.film.id + "?" + params;
-  if (player.filmId !== room.film.id) player.duration = 0;
-  player.filmId = room.film.id;
-  player.time = target;
-  player.timeAt = Date.now();
-  player.playing = false;
-  lastTick = null; // the jump to startAt is not someone seeking
-
-  $("curtain-time").textContent = clock(target);
-  const line = $("curtain-line");
-  line.replaceWith(line.cloneNode(true)); // restart the 6 s progress line
-  $("curtain").classList.remove("gone");
-  clearTimeout(capTimer);
-  clearTimeout(settleTimer);
-  // The curtain gives up after 6 s, but we keep ignoring the player's own
-  // events until it lands, or a slow load would be mistaken for someone seeking.
-  capTimer = setTimeout(hideCurtain, CURTAIN_CAP);
-  settleTimer = setTimeout(settle, SETTLE_CAP);
+  curtain("Loading " + room.film.title + "…");
+  video.src = url;
+  const track = $("subs");
+  track.src = subs || "";
+  $("cc").hidden = !subs;
+  setCaptions(localStorage.couchCaptions === "on");
+  video.load();
+  // Wait for the file's index before seeking into it, but never forever.
+  await Promise.race([
+    new Promise((resolve) => video.addEventListener("loadedmetadata", resolve, { once: true })),
+    new Promise((resolve) => setTimeout(resolve, CURTAIN_CAP)),
+  ]);
 }
 
-// Move our player to where the room is now.
+function detach() {
+  if (!playing) return;
+  playing = null;
+  video.removeAttribute("src");
+  video.load();
+}
+
+// Put our player where the room is.
 function follow() {
-  goTo(roomTime() + (room.playing ? lagEstimate : 0), room.playing);
-}
-
-function goTo(target, playing) {
-  if (loading) return; // settle() calls follow() once the page has landed
-  target = Math.max(0, target);
-  quietUntil = Date.now() + 2000; // the player's echoes of this command
-  lastTick = null;
-  loadTarget = target;
-  measuring = playing;
-  player.time = target;
-  player.timeAt = Date.now();
-  command({ seek: target, play: playing, unmute: true });
-  // Chrome lets the room start the player because of the "sit down" click.
-  // If it ever refuses, say so instead of sitting there paused.
-  if (playing) {
-    setTimeout(() => {
-      if (room && room.playing && !player.playing && !loading) toast("Press play in the player: the browser didn't let couch start it.", 5000);
-    }, 3000);
+  if (!playing) return;
+  const target = roomTime();
+  if (Math.abs(video.currentTime - target) > 0.5) video.currentTime = target + (room.playing ? SEEK_LEAD : 0);
+  if (room.playing) {
+    video.play().catch(() => toast("Press play: the browser didn't let couch start the film.", 5000));
+  } else {
+    video.pause();
   }
 }
 
-function command(cmd) {
-  $("player").contentWindow.postMessage({ type: "COUCH_COMMAND", ...cmd }, SCREEN);
+// Report a change made by the person at this screen. Seeking fires a burst of
+// events while the bar is dragged, so only where it settles is sent.
+function report() {
+  clearTimeout(sendTimer);
+  sendTimer = setTimeout(() => {
+    send({ type: "set", playing: !video.paused, time: video.currentTime });
+  }, 300);
 }
 
-function hideCurtain() {
-  $("curtain").classList.add("gone");
-}
-
-function settle() {
-  if (!loading) return;
-  loading = false;
-  clearTimeout(capTimer);
-  clearTimeout(settleTimer);
-  hideCurtain();
-  follow(); // catch up with the room: it may have moved, or be playing, while we loaded
-}
-
-window.addEventListener("message", (event) => {
-  if (event.origin !== SCREEN) return;
-  let data = event.data;
-  if (typeof data === "string") {
-    try {
-      data = JSON.parse(data);
-    } catch {
-      return;
-    }
-  }
-  if (!data || !room || !room.film) return;
-
-  if (data.type === "MEDIA_DATA") {
-    const media = data.data && data.data[room.film.id];
-    if (media && media.backdrop_path) backdrops[room.film.id] = media.backdrop_path;
-    return;
-  }
-  if (data.type !== "PLAYER_EVENT") return;
-
-  const event_ = data.data.event;
-  player.time = data.data.currentTime || 0;
-  player.timeAt = Date.now();
-  if (data.data.duration) player.duration = data.data.duration;
-  if (event_ === "play") player.playing = true;
-  if (event_ === "pause" || event_ === "ended") player.playing = false;
-  updateClock();
-
-  if (loading) {
-    // The page has landed when vidlink finishes its own jump to startAt
-    // (seeked), or reports a time near where we sent it.
-    const near = Math.abs(player.time - loadTarget) < 3;
-    const landed = event_ === "seeked" || (event_ === "timeupdate" && near);
-    if (landed) {
-      settle();
-    }
-    return;
-  }
-
-  // First real playback after a play command: how far behind the room did
-  // we land? Add that to the guess for next time.
-  if (measuring && event_ === "timeupdate" && player.playing && player.time > loadTarget + 0.5) {
-    measuring = false;
-    const behind = roomTime() - player.time;
-    lagEstimate = Math.min(5, Math.max(0, lagEstimate + behind));
-  }
-
-  if (event_ === "ended") {
-    send({ type: "ended" });
-    return;
-  }
-
-  // A seek is a jump between two time reports that playback can't explain.
-  // The "seeked" event itself is useless: JW sends it before the jump, with
-  // the old time. Comparing against our own last report (not the room clock)
-  // means a seat that loaded late never mistakes its lag for a seek.
-  let jumped = false;
-  if (event_ === "timeupdate") {
-    if (lastTick) {
-      const wall = (Date.now() - lastTick.at) / 1000;
-      const moved = player.time - lastTick.time;
-      const allowed = player.playing ? wall + 2 : 2; // paused players shouldn't move at all
-      jumped = moved > allowed || moved < -2;
-    }
-    lastTick = { time: player.time, at: Date.now() };
-  }
-
-  if (Date.now() < quietUntil) return;
-  // A play while the room already plays is the player starting after a
-  // buffer, not a person. Same for a pause while the room is paused.
-  if (event_ === "play" && room.playing) return;
-  if (event_ === "pause" && !room.playing) return;
-  if (event_ === "play" || event_ === "pause" || jumped) {
-    wake();
-    // Seeking fires pause/seeked/play in a burst; send only where it settles.
-    clearTimeout(sendTimer);
-    sendTimer = setTimeout(() => {
-      send({ type: "set", playing: player.playing, time: myTime() });
-    }, 400);
-  }
+video.addEventListener("play", () => {
+  if (room && !room.playing) report();
 });
+video.addEventListener("pause", () => {
+  if (video.ended) return;
+  if (room && room.playing) report();
+});
+video.addEventListener("seeked", () => {
+  if (room && Math.abs(video.currentTime - roomTime()) > 2.5) report(); // wider than SEEK_LEAD
+});
+video.addEventListener("ended", () => send({ type: "ended" }));
+video.addEventListener("canplay", hideCurtain);
+video.addEventListener("timeupdate", updateClock);
 
 // Tell the other browser where we are, for the drift badge.
 setInterval(() => {
-  if (!seated || !room || !room.film || room.ended || loading) return;
-  send({ type: "pos", time: myTime(), playing: player.playing });
-  updateClock();
+  if (!seated || !playing || !room || room.ended) return;
+  send({ type: "pos", time: video.currentTime, playing: !video.paused });
 }, 3000);
+
+// ---------- curtain ----------
+
+function curtain(text) {
+  $("curtain-text").textContent = text;
+  const line = $("curtain-line");
+  line.replaceWith(line.cloneNode(true)); // restart the progress line
+  $("curtain").classList.remove("gone");
+  clearTimeout(capTimer);
+  capTimer = setTimeout(hideCurtain, CURTAIN_CAP);
+}
+
+function hideCurtain() {
+  if (room && room.film && !room.src) return; // offline notice stays up
+  clearTimeout(capTimer);
+  $("curtain").classList.add("gone");
+}
+
+// ---------- subtitles ----------
+
+function setCaptions(on) {
+  const track = video.textTracks[0];
+  if (track) track.mode = on ? "showing" : "hidden";
+  $("cc").classList.toggle("on", on);
+  $("cc").setAttribute("aria-pressed", String(on));
+}
+
+$("cc").addEventListener("click", () => {
+  const on = localStorage.couchCaptions !== "on";
+  localStorage.couchCaptions = on ? "on" : "off";
+  setCaptions(on);
+});
 
 // ---------- pill ----------
 
@@ -354,10 +260,10 @@ function wake() {
 
 // Seconds we are ahead of the other person (negative: behind). Null if unknown.
 function driftSeconds() {
-  if (!peerPos || loading || !otherPeer()) return null;
+  if (!peerPos || !playing || !otherPeer()) return null;
   if (Date.now() - peerPos.at > 10000) return null; // stale report
   const theirs = peerPos.time + (peerPos.playing ? (Date.now() - peerPos.at) / 1000 : 0);
-  return myTime() - theirs;
+  return video.currentTime - theirs;
 }
 
 function updatePill() {
@@ -383,16 +289,14 @@ function updatePill() {
 }
 
 function updateClock() {
-  if (!player.duration) {
-    $("clock").textContent = clock(myTime());
-    return;
+  const el = $("clock");
+  el.textContent = clock(video.currentTime) + " ";
+  if (video.duration) {
+    const of = document.createElement("span");
+    of.className = "of";
+    of.textContent = "/ " + clock(video.duration);
+    el.append(of);
   }
-  $("clock").innerHTML = "";
-  $("clock").append(clock(myTime()) + " ");
-  const of = document.createElement("span");
-  of.className = "of";
-  of.textContent = "/ " + clock(player.duration);
-  $("clock").append(of);
 }
 
 $("resync").addEventListener("click", () => {
@@ -400,19 +304,17 @@ $("resync").addEventListener("click", () => {
   if (drift === null) return;
   if (drift < 0) {
     // We are behind: jump ourselves to them.
-    const theirs = peerPos.time + (peerPos.playing ? (Date.now() - peerPos.at) / 1000 : 0);
-    goTo(theirs + (peerPos.playing ? lagEstimate : 0), peerPos.playing);
+    video.currentTime = peerPos.time + (peerPos.playing ? (Date.now() - peerPos.at) / 1000 : 0);
   } else {
     // They are behind: pull them to us.
-    send({ type: "pull", time: myTime(), playing: player.playing });
-    toast("Pulling " + otherPeer().name + " to " + clock(myTime()));
+    send({ type: "pull", time: video.currentTime, playing: !video.paused });
+    toast("Pulling " + otherPeer().name + " to " + clock(video.currentTime));
   }
   peerPos = null;
   updatePill();
 });
 
-$("strip").addEventListener("mousemove", wake);
-$("pill").addEventListener("mouseenter", wake);
+$("stage").addEventListener("mousemove", wake);
 
 $("fullscreen").addEventListener("click", () => {
   if (document.fullscreenElement) document.exitFullscreen();
@@ -439,11 +341,6 @@ function renderGate() {
   $("gate-peer").textContent = other ? other.name + " is already here." : "";
 }
 
-// vidlink serves most films as H.265 MP4s tagged "hev1". Safari only plays
-// "hvc1" and Firefox (Zen) has no H.265 on macOS, so warn before sitting down.
-const testVideo = document.createElement("video");
-$("codec-warning").hidden = testVideo.canPlayType('video/mp4; codecs="hev1.1.6.L93.B0"') !== "";
-
 $("name-field").hidden = !!me.name;
 $("name").value = me.name;
 
@@ -466,7 +363,7 @@ $("name").addEventListener("keydown", (event) => {
   if (event.key === "Enter") sitDown();
 });
 
-// ---------- empty room and pasting ----------
+// ---------- empty room ----------
 
 function renderEmpty() {
   if (room && room.last) {
@@ -476,101 +373,6 @@ function renderEmpty() {
     $("last").textContent = "";
   }
 }
-
-// Search runs through our Worker (Wikidata), so nobody has to open 1shows.
-let searchTimer = null;
-let searchResults = [];
-
-$("query").addEventListener("input", () => {
-  clearTimeout(searchTimer);
-  searchTimer = setTimeout(runSearch, 250);
-});
-
-$("search").addEventListener("submit", (event) => {
-  event.preventDefault();
-  if (searchResults.length) pickFilm(searchResults[0]);
-});
-
-async function runSearch() {
-  const query = $("query").value.trim();
-  if (query.length < 2) {
-    showResults([]);
-    return;
-  }
-  let films = [];
-  try {
-    films = await (await fetch("/api/search?q=" + encodeURIComponent(query))).json();
-  } catch {
-    $("search-note").textContent = "Search isn't answering. A pasted 1shows link still works.";
-    return;
-  }
-  if ($("query").value.trim() !== query) return; // a newer search is on its way
-  showResults(films);
-  $("search-note").textContent = films.length ? "Enter picks the first one." : "No films found for that. Try the original title.";
-}
-
-function showResults(films) {
-  searchResults = films;
-  const list = $("results");
-  list.innerHTML = "";
-  films.forEach((film, index) => {
-    const item = document.createElement("li");
-    const button = document.createElement("button");
-    if (index === 0) button.classList.add("first");
-    const title = document.createElement("span");
-    title.className = "title";
-    title.textContent = film.title;
-    const meta = document.createElement("span");
-    meta.className = "meta";
-    meta.textContent = [film.year, film.director].filter(Boolean).join(", ");
-    button.append(title, meta);
-    button.addEventListener("click", () => pickFilm(film));
-    item.append(button);
-    list.append(item);
-  });
-}
-
-function pickFilm(film) {
-  $("query").value = "";
-  showResults([]);
-  send({ type: "load", id: String(film.id), title: film.title });
-}
-
-document.addEventListener("paste", (event) => {
-  if (!seated) return;
-  const text = event.clipboardData.getData("text");
-  const match = text.match(/1shows\.[a-z]+\/movies\/(\d+)(?:-([a-z0-9-]+))?/i);
-  if (!match) {
-    if (event.target === $("query")) return; // pasting a title into the search box
-    toast("That isn't a 1shows film link");
-    return;
-  }
-  event.preventDefault();
-  const film = { id: match[1], title: match[2] ? titleFromSlug(match[2]) : "Film " + match[1] };
-  if (room && room.film && !room.ended && room.film.id !== film.id) {
-    // Mid-film: ask before replacing what is playing.
-    pendingFilm = film;
-    $("confirm-text").textContent = "Switch to " + film.title + "?";
-    $("confirm").hidden = false;
-    $("confirm-yes").focus();
-    return;
-  }
-  send({ type: "load", id: film.id, title: film.title });
-});
-
-$("confirm-yes").addEventListener("click", () => {
-  if (pendingFilm) send({ type: "load", id: pendingFilm.id, title: pendingFilm.title });
-  pendingFilm = null;
-  $("confirm").hidden = true;
-});
-$("confirm-no").addEventListener("click", () => {
-  pendingFilm = null;
-  $("confirm").hidden = true;
-});
-document.addEventListener("keydown", (event) => {
-  if ($("confirm").hidden) return;
-  if (event.key === "Escape") $("confirm-no").click();
-});
 
 // ---------- after the film ----------
 
@@ -582,9 +384,7 @@ function renderAfter() {
     detailsFor = film.id;
     $("after-title").textContent = film.title;
     for (const id of ["facts", "tagline", "plot", "about", "credits"]) $(id).textContent = "";
-    $("backdrop").style.backgroundImage = backdrops[film.id]
-      ? "url(https://image.tmdb.org/t/p/w1280" + backdrops[film.id] + ")"
-      : "";
+    $("backdrop").style.backgroundImage = "";
     loadDetails(film.id);
   }
   renderVerdict();
@@ -599,7 +399,7 @@ async function loadDetails(id) {
   }
   if (detailsFor !== id) return;
   if (info.title) $("after-title").textContent = info.title;
-  if (!backdrops[id] && info.poster) $("backdrop").style.backgroundImage = "url(" + info.poster + ")";
+  if (info.poster) $("backdrop").style.backgroundImage = "url(" + info.poster + ")";
 
   const facts = $("facts");
   const bits = [];

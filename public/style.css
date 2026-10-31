@@ -111,14 +111,6 @@ button { cursor: pointer; }
 .panel p { margin: 0; max-width: 34ch; color: var(--mute); }
 .panel .lead { color: var(--ink); font-size: 20px; }
 
-.panel .warning {
-  max-width: 44ch;
-  padding: 12px 18px;
-  border: 1px solid rgba(232, 241, 245, 0.22);
-  border-radius: 12px;
-  color: var(--ink);
-}
-
 .name {
   display: grid;
   gap: 8px;
@@ -153,67 +145,33 @@ button { cursor: pointer; }
 
 /* ---------- empty room ---------- */
 
-.visually-hidden {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  overflow: hidden;
-  clip-path: inset(50%);
-}
-
-.search input {
-  width: min(16ch, 80vw);
-  border: 0;
-  border-bottom: 1px solid var(--edge);
-  background: transparent;
-  padding: 4px 0 10px;
+.panel .nothing-on {
   font-size: clamp(32px, 5.4vw, 64px);
   font-weight: 500;
   letter-spacing: -0.03em;
-  text-align: center;
-  caret-color: var(--cyan);
-  outline: none;
-  transition: border-color 200ms var(--ease);
-}
-.search input::placeholder { color: rgba(232, 241, 245, 0.35); }
-.search input:focus { border-color: var(--cyan); }
-.search input:focus-visible { outline: none; border-radius: 0; } /* the cyan underline is the focus ring */
-
-.results {
-  list-style: none;
-  margin: -8px 0 0;
-  padding: 0;
-  display: grid;
-  gap: 2px;
-  width: min(520px, 86vw);
-}
-.results button {
-  width: 100%;
-  display: grid;
-  gap: 2px;
-  padding: 10px 16px;
-  border: 0;
-  border-radius: 12px;
-  background: transparent;
-  text-align: left;
-  transition: background 140ms var(--ease);
-}
-.results button:focus-visible,
-.results button.first { background: rgba(61, 245, 255, 0.07); }
-.results .title { font-size: 19px; }
-.results .meta { font-size: 14px; color: var(--mute); }
-@media (hover: hover) and (pointer: fine) {
-  .results button:hover { background: rgba(232, 241, 245, 0.06); }
+  line-height: 1.05;
+  color: var(--ink);
+  max-width: none;
 }
 
+.panel code {
+  font-family: var(--mono);
+  font-size: 0.92em;
+  color: var(--cyan);
+}
 
 /* ---------- stage: the player and what floats over it ---------- */
 
 .stage { position: fixed; inset: 0; background: #000; }
-.stage iframe { width: 100%; height: 100%; border: 0; display: block; }
+.stage video { width: 100%; height: 100%; display: block; background: #000; accent-color: var(--cyan); }
 
-/* The player swallows mouse events, so this strip is where the pill wakes up. */
-.hover-strip { position: absolute; top: 0; left: 0; right: 0; height: 72px; }
+/* Subtitles in the room's type, on a soft plate rather than a black bar. */
+.stage video::cue {
+  font-family: var(--sans);
+  font-size: 1.05em;
+  color: #fff;
+  background: rgba(6, 10, 18, 0.62);
+}
 
 .pill {
   position: absolute;
@@ -261,6 +219,19 @@ button { cursor: pointer; }
   text-underline-offset: 3px;
 }
 
+.cc {
+  border: 1px solid var(--edge);
+  border-radius: 6px;
+  background: transparent;
+  padding: 2px 6px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--mute);
+  transition: color 160ms var(--ease), border-color 160ms var(--ease), box-shadow 160ms var(--ease);
+}
+.cc.on { color: #fff; border-color: var(--cyan); box-shadow: var(--glow); }
+
 .icon-button {
   display: grid;
   place-items: center;
@@ -307,8 +278,7 @@ button { cursor: pointer; }
   transition: opacity 240ms var(--ease);
 }
 .curtain.gone { opacity: 0; pointer-events: none; transition-duration: 180ms; }
-.curtain p { margin: 0; font-size: 22px; letter-spacing: -0.01em; }
-.curtain .time { font-size: 22px; }
+.curtain p { margin: 0; max-width: 36ch; font-size: 22px; letter-spacing: -0.01em; text-align: center; }
 .curtain .line {
   width: 160px;
   height: 2px;
@@ -327,27 +297,6 @@ button { cursor: pointer; }
   animation: fill 6s linear forwards;
 }
 @keyframes fill { from { transform: scaleX(0); } to { transform: scaleX(1); } }
-
-.confirm {
-  position: absolute;
-  z-index: 4;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  display: grid;
-  gap: 18px;
-  justify-items: center;
-  padding: 28px 32px;
-  border: 1px solid var(--edge);
-  border-radius: 18px;
-  background: var(--glass);
-  backdrop-filter: blur(18px);
-  -webkit-backdrop-filter: blur(18px);
-  text-align: center;
-}
-.confirm p { margin: 0; font-size: 22px; }
-.confirm .row { display: flex; gap: 10px; }
-.confirm .primary { border-color: var(--cyan); color: #fff; }
 
 /* ---------- after the film ---------- */
 

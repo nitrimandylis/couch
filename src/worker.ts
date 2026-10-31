@@ -1,13 +1,18 @@
 import { DurableObject } from "cloudflare:workers";
 
 // One room per bookmark. The Room object holds the shared playback state and
-// relays events between the two browsers over WebSockets.
+// relays events between the two browsers over WebSockets. The film itself comes
+// from `cine couch` on the host's Mac, which joins as a "source" (not a seat)
+// and tells the room what is on and where to stream it from.
 
-type Film = { id: string; title: string };
+type Film = { id: string; title: string; year?: number }; // id is the IMDb id
+// Where the browsers fetch the film and its subtitles: the tunnel.
+type Src = { url: string; subs: string | null };
 type Rating = { name: string; stars: number };
 
 type State = {
   film: Film | null;
+  src: Src | null; // null while cine couch is not running
   playing: boolean;
   time: number; // seconds into the film at moment `at`
   at: number; // server ms timestamp when `time` was recorded
@@ -17,11 +22,27 @@ type State = {
 };
 
 type Seat = { id: string; name: string };
+type Source = { source: true };
+
+function isSeat(attachment: unknown): attachment is Seat {
+  return !!attachment && typeof (attachment as Seat).name === "string";
+}
+
+function isSource(attachment: unknown): attachment is Source {
+  return !!attachment && (attachment as Source).source === true;
+}
+
+// A stream URL must be a Cloudflare quick tunnel.
+function streamUrl(value: unknown): string | null {
+  const url = String(value ?? "");
+  if (/^https:\/\/[a-z0-9-]+\.trycloudflare\.com\//.test(url)) return url.slice(0, 300);
+  return null;
+}
 
 const ROOM_ID = /^[a-z0-9]{6,32}$/;
 
 function emptyState(): State {
-  return { film: null, playing: false, time: 0, at: 0, ended: false, ratings: {}, last: null };
+  return { film: null, src: null, playing: false, time: 0, at: 0, ended: false, ratings: {}, last: null };
 }
 
 // Where the film should be right now, according to the room.
@@ -37,7 +58,7 @@ export class Room extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     ctx.blockConcurrencyWhile(async () => {
-      this.state = (await ctx.storage.get<State>("state")) ?? emptyState();
+      this.state = { ...emptyState(), ...(await ctx.storage.get<State>("state")) };
     });
   }
 
@@ -57,7 +78,7 @@ export class Room extends DurableObject<Env> {
       return;
     }
     const s = this.state;
-    const seat = ws.deserializeAttachment() as Seat | null;
+    const attachment = ws.deserializeAttachment();
 
     if (msg.type === "hello") {
       const name = String(msg.name || "").trim().slice(0, 24) || "Someone";
@@ -67,7 +88,37 @@ export class Room extends DurableObject<Env> {
       this.sendPeers();
       return;
     }
-    if (!seat) return; // everything below needs a seated browser
+    // cine couch on the host's Mac: what is on, and where to stream it from.
+    if (msg.type === "source") {
+      const film = msg.film ?? {};
+      const id = String(film.id ?? "");
+      const url = streamUrl(msg.url);
+      if (!/^tt\d+$/.test(id) || !url) return;
+      ws.serializeAttachment({ source: true });
+      s.src = { url, subs: streamUrl(msg.subs) };
+      let action = "source";
+      if (!s.film || s.film.id !== id || s.ended) {
+        // A new film. The same film again (cine restarted) keeps its position.
+        s.film = { id, title: String(film.title || "Untitled").slice(0, 120), year: Number(film.year) || undefined };
+        s.playing = false;
+        s.time = 0;
+        s.at = Date.now();
+        s.ended = false;
+        s.ratings = {};
+        action = "load";
+      }
+      await this.save();
+      this.broadcast(this.stateMessage(action, null));
+      ws.send(JSON.stringify({ type: "peers", peers: this.seats() })); // cine shows who is in the room
+      return;
+    }
+    if (msg.type === "source-off") {
+      if (isSource(attachment)) await this.sourceGone();
+      return;
+    }
+
+    if (!isSeat(attachment)) return; // everything below needs a seated browser
+    const seat = attachment;
 
     if (msg.type === "pos") {
       this.lastPos = Number(msg.time) || 0;
@@ -87,17 +138,7 @@ export class Room extends DurableObject<Env> {
 
     let action: string | null = null;
 
-    if (msg.type === "load") {
-      const id = String(msg.id || "");
-      if (!/^\d+$/.test(id)) return;
-      s.film = { id, title: String(msg.title || "Untitled").slice(0, 120) };
-      s.playing = false;
-      s.time = 0;
-      s.at = Date.now();
-      s.ended = false;
-      s.ratings = {};
-      action = "load";
-    } else if (msg.type === "set") {
+    if (msg.type === "set") {
       if (!s.film || s.ended) return;
       const playing = !!msg.playing;
       const time = Math.max(0, Number(msg.time) || 0);
@@ -123,6 +164,7 @@ export class Room extends DurableObject<Env> {
       if (!s.ended || !s.film) return;
       s.last = { title: s.film.title, finished: Date.now() };
       s.film = null;
+      s.src = null;
       s.ended = false;
       s.ratings = {};
       action = "done";
@@ -135,9 +177,15 @@ export class Room extends DurableObject<Env> {
   }
 
   async webSocketClose(ws: WebSocket) {
+    if (isSource(ws.deserializeAttachment())) {
+      // cine couch lost its connection: nothing to stream from until it is back.
+      const others = this.ctx.getWebSockets().filter((w) => w !== ws && isSource(w.deserializeAttachment()));
+      if (others.length === 0) await this.sourceGone();
+      return;
+    }
     this.sendPeers(ws);
     // Last one out: freeze the film where it was, so tomorrow resumes there.
-    const left = this.ctx.getWebSockets().filter((w) => w !== ws && w.deserializeAttachment());
+    const left = this.ctx.getWebSockets().filter((w) => w !== ws && isSeat(w.deserializeAttachment()));
     if (left.length === 0 && this.state.playing) {
       this.state.time = this.lastPos ?? currentTime(this.state);
       this.state.playing = false;
@@ -148,6 +196,20 @@ export class Room extends DurableObject<Env> {
 
   async webSocketError(ws: WebSocket) {
     await this.webSocketClose(ws);
+  }
+
+  // The film's source stopped: hold the film where it is, paused.
+  async sourceGone() {
+    const s = this.state;
+    if (!s.src) return;
+    s.src = null;
+    if (s.playing) {
+      s.time = this.lastPos ?? currentTime(s);
+      s.playing = false;
+      s.at = Date.now();
+    }
+    await this.save();
+    this.broadcast(this.stateMessage("source-off", null));
   }
 
   // Ratings stay hidden until both people have rated.
@@ -166,13 +228,16 @@ export class Room extends DurableObject<Env> {
     };
   }
 
-  sendPeers(closing?: WebSocket) {
-    const peers = this.ctx
+  seats(closing?: WebSocket): Seat[] {
+    return this.ctx
       .getWebSockets()
       .filter((w) => w !== closing)
-      .map((w) => w.deserializeAttachment() as Seat | null)
-      .filter((seat): seat is Seat => !!seat);
-    this.broadcast({ type: "peers", peers }, closing);
+      .map((w) => w.deserializeAttachment())
+      .filter(isSeat);
+  }
+
+  sendPeers(closing?: WebSocket) {
+    this.broadcast({ type: "peers", peers: this.seats(closing) }, closing);
   }
 
   broadcast(msg: object, skip?: WebSocket) {
@@ -188,7 +253,7 @@ export class Room extends DurableObject<Env> {
   sendToOthers(from: WebSocket, msg: object) {
     const text = JSON.stringify(msg);
     for (const w of this.ctx.getWebSockets()) {
-      if (w === from || !w.deserializeAttachment()) continue;
+      if (w === from || !isSeat(w.deserializeAttachment())) continue;
       try {
         w.send(text);
       } catch {}
@@ -210,31 +275,30 @@ const IMDB_HEADERS = {
 };
 const POLITE_UA = { "user-agent": "couch/0.1 (https://couch.nicktrim.com)" };
 
-async function filmDetails(tmdb: string, ctx: ExecutionContext): Promise<Response> {
+async function filmDetails(imdb: string, ctx: ExecutionContext): Promise<Response> {
   const cache = caches.default;
-  const key = new Request(`https://couch.nicktrim.com/api/film/${tmdb}?v=2`);
+  const key = new Request(`https://couch.nicktrim.com/api/film/${imdb}?v=3`);
   const hit = await cache.match(key);
   if (hit) return hit;
 
-  const out: any = { imdb: null, title: null, year: null, runtime: null, genres: [], tagline: null, plot: null, poster: null, directors: [], writers: [], stars: [], about: null, wiki: null };
+  const out: any = { imdb, title: null, year: null, runtime: null, genres: [], tagline: null, plot: null, poster: null, directors: [], writers: [], stars: [], about: null, wiki: null };
 
-  // 1. Wikidata: TMDB id -> IMDb id, Wikipedia article, and the basic facts.
+  // 1. Wikidata: IMDb id -> Wikipedia article and the basic facts.
   // IMDb refuses requests from Cloudflare's servers, so these are the fallback.
   try {
-    const sparql = `SELECT ?imdb ?article (MIN(YEAR(?date)) AS ?year) (SAMPLE(?mins) AS ?runtime)
+    const sparql = `SELECT ?article (MIN(YEAR(?date)) AS ?year) (SAMPLE(?mins) AS ?runtime)
       (GROUP_CONCAT(DISTINCT ?dirLabel; separator="|") AS ?dirs)
       (GROUP_CONCAT(DISTINCT ?genreLabel; separator="|") AS ?genres) WHERE {
-      ?f wdt:P4947 "${tmdb}"; wdt:P345 ?imdb.
+      ?f wdt:P345 "${imdb}".
       OPTIONAL { ?article schema:about ?f; schema:isPartOf <https://en.wikipedia.org/> }
       OPTIONAL { ?f wdt:P577 ?date }
       OPTIONAL { ?f wdt:P2047 ?mins }
       OPTIONAL { ?f wdt:P57 ?dir. ?dir rdfs:label ?dirLabel. FILTER(LANG(?dirLabel) = "en") }
       OPTIONAL { ?f wdt:P136 ?genre. ?genre rdfs:label ?genreLabel. FILTER(LANG(?genreLabel) = "en") }
-    } GROUP BY ?imdb ?article LIMIT 1`;
+    } GROUP BY ?article LIMIT 1`;
     const r = await fetch(`https://query.wikidata.org/sparql?format=json&query=${encodeURIComponent(sparql)}`, { headers: POLITE_UA });
     const row = ((await r.json()) as any).results.bindings[0];
     if (row) {
-      out.imdb = row.imdb?.value ?? null;
       out.wiki = row.article?.value ?? null;
       out.year = row.year ? Number(row.year.value) : null;
       out.runtime = row.runtime ? Number(row.runtime.value) * 60 : null;
@@ -289,104 +353,11 @@ async function filmDetails(tmdb: string, ctx: ExecutionContext): Promise<Respons
   return res;
 }
 
-// ---------- film search (so nobody has to visit 1shows and its ads) ----------
-
-async function searchFilms(query: string): Promise<Response> {
-  // Wikidata full-text search, limited to items with a TMDB movie id (P4947),
-  // which also keeps out TV series.
-  const q = query.replace(/["\\\s]+/g, " ").trim().slice(0, 80);
-  if (q.length < 2) return Response.json([]);
-  const sparql = `SELECT ?tmdb ?label (MIN(YEAR(?date)) AS ?year) (SAMPLE(?dirLabel) AS ?director) ?ordinal WHERE {
-    SERVICE wikibase:mwapi {
-      bd:serviceParam wikibase:api "Search"; wikibase:endpoint "www.wikidata.org";
-        mwapi:srsearch "${q} haswbstatement:P4947"; mwapi:srlimit "10".
-      ?item wikibase:apiOutputItem mwapi:title. ?ordinal wikibase:apiOrdinal true.
-    }
-    ?item wdt:P4947 ?tmdb.
-    ?item rdfs:label ?label. FILTER(LANG(?label) = "en")
-    OPTIONAL { ?item wdt:P577 ?date }
-    OPTIONAL { ?item wdt:P57 ?d. ?d rdfs:label ?dirLabel. FILTER(LANG(?dirLabel) = "en") }
-  } GROUP BY ?tmdb ?label ?ordinal ORDER BY ?ordinal LIMIT 5`;
-  try {
-    const r = await fetch(`https://query.wikidata.org/sparql?format=json&query=${encodeURIComponent(sparql)}`, { headers: POLITE_UA });
-    const rows = ((await r.json()) as any).results.bindings;
-    const films = rows.map((row: any) => ({
-      id: row.tmdb.value,
-      title: row.label.value,
-      year: row.year ? Number(row.year.value) : null,
-      director: row.director?.value ?? null,
-    }));
-    return Response.json(films, { headers: { "cache-control": "public, max-age=3600" } });
-  } catch {
-    return Response.json([], { status: 502 });
-  }
-}
-
-// ---------- the screen: vidlink's player page, served from our own subdomain ----------
-// vidlink's player takes no commands and opens ad pop-ups on clicks. Serving its
-// page from a couch subdomain lets us inject /couch-screen.js into it, which
-// blocks the pop-ups and drives the JW player on behalf of the room page.
-// Only the page, its scripts and its API go through here; the video file
-// itself streams straight from vidlink's host to the browser.
-
-const SCREEN_HOSTS = ["screen.couch.nicktrim.com"];
-
-async function screen(req: Request, env: Env, url: URL): Promise<Response> {
-  if (url.pathname === "/couch-screen.js") return env.ASSETS.fetch(req);
-  // vidlink's page fetches its pop-up ad libraries from these two (PopAds and
-  // Adcash). Answering with nothing means they never load.
-  if (url.pathname === "/api/venus" || url.pathname === "/api/mercury") return new Response("", { status: 200 });
-
-  const headers = new Headers(req.headers);
-  headers.delete("host");
-  headers.delete("cookie");
-  headers.set("accept-encoding", "gzip"); // the Worker can only rewrite what it can decode
-  headers.set("origin", "https://vidlink.pro");
-  headers.set("referer", "https://vidlink.pro" + url.pathname);
-  // The page tells vidlink's API what the browser can play. Chrome says
-  // "dash-hevc" and gets a DASH stream from a host that refuses any origin but
-  // vidlink's. "standard" gets plain MP4 files, which play from anywhere.
-  if (url.pathname.startsWith("/api/b/")) headers.set("x-playback-environment", "standard");
-  const upstream = await fetch("https://vidlink.pro" + url.pathname + url.search, {
-    method: req.method,
-    headers,
-    body: req.method === "GET" || req.method === "HEAD" ? undefined : req.body,
-    redirect: "manual",
-  });
-
-  // The API flags every MP4 as needing vidlink's relay host, which refuses any
-  // origin but vidlink's. The files themselves play directly with no referrer,
-  // so clear the flag and the page uses the direct links.
-  if (url.pathname.startsWith("/api/b/") && upstream.ok) {
-    const data = (await upstream.json()) as any;
-    for (const quality of Object.values(data?.stream?.qualities ?? {}) as any[]) {
-      if (quality.type === "mp4") quality.requiresProxy = false;
-    }
-    return Response.json(data, { headers: { "cache-control": "no-store" } });
-  }
-
-  const response = new Response(upstream.body, upstream);
-  response.headers.delete("content-security-policy");
-  response.headers.delete("x-frame-options");
-  response.headers.delete("set-cookie");
-  if (!(upstream.headers.get("content-type") ?? "").includes("text/html")) return response;
-
-  // No referrer: the video host answers 429 to anything but an empty one.
-  return new HTMLRewriter()
-    .on("head", {
-      element(head) {
-        head.prepend('<meta name="referrer" content="no-referrer"><script src="/couch-screen.js"></script>', { html: true });
-      },
-    })
-    .transform(response);
-}
-
 // ---------- routing ----------
 
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(req.url);
-    if (SCREEN_HOSTS.includes(url.host)) return screen(req, env, url);
     const parts = url.pathname.split("/").filter(Boolean);
 
     if (parts[0] === "r" && parts[1] && ROOM_ID.test(parts[1])) {
@@ -398,11 +369,7 @@ export default {
       if (parts.length === 2) return env.ASSETS.fetch(new Request(new URL("/room", url), req));
     }
 
-    if (parts[0] === "api" && parts[1] === "search") {
-      return searchFilms(url.searchParams.get("q") ?? "");
-    }
-
-    if (parts[0] === "api" && parts[1] === "film" && /^\d+$/.test(parts[2] ?? "")) {
+    if (parts[0] === "api" && parts[1] === "film" && /^tt\d+$/.test(parts[2] ?? "")) {
       return filmDetails(parts[2], ctx);
     }
 

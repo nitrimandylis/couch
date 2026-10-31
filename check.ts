@@ -1,5 +1,6 @@
 // Smoke check for the room protocol. Start `bunx wrangler dev`, then: bun check.ts
-// Two fake browsers sit down, load a film, play, rate blind, and finish.
+// Two fake browsers sit down, a fake `cine couch` puts a film on, they play,
+// the source drops and comes back, they rate blind, and finish.
 
 function ok(cond: boolean, what: string) {
   if (!cond) throw new Error("failed: " + what);
@@ -39,13 +40,30 @@ b.hello();
 const peers = await a.next((m) => m.type === "peers" && m.peers.length === 2);
 ok(peers.peers.map((p: any) => p.name).sort().join() === "Guest,Nick", "both seated");
 
-a.send({ type: "load", id: "550", title: "Fight Club" });
+const cine = seat("source", "cine");
+await cine.opened;
+const film = { id: "tt0137523", title: "Fight Club", year: 1999 };
+const tunnel = "https://abc-def.trycloudflare.com/token/film.mp4";
+cine.send({ type: "source", film, url: tunnel });
 const loaded = await b.next((m) => m.type === "state" && m.action === "load");
-ok(loaded.state.film.id === "550" && loaded.by === "Nick", "load reaches the other seat");
+ok(loaded.state.film.id === "tt0137523" && loaded.state.src.url === tunnel, "the source puts the film on for both");
+cine.send({ type: "source", film, url: "https://evil.example.com/x" });
 
 b.send({ type: "set", playing: true, time: 0 });
 const played = await a.next((m) => m.type === "state" && m.action === "play");
 ok(played.state.playing === true && played.by === "Guest", "play is relayed with a name");
+
+// The source drops: the film holds, paused. It comes back: same place.
+cine.ws.close();
+const gone = await a.next((m) => m.type === "state" && m.action === "source-off");
+ok(gone.state.src === null && gone.state.playing === false && gone.state.film.id === "tt0137523", "source loss pauses and keeps the film");
+const cine2 = seat("source2", "cine");
+await cine2.opened;
+cine2.send({ type: "source", film, url: tunnel });
+const back = await a.next((m) => m.type === "state" && m.action === "source");
+ok(back.state.src.url === tunnel && back.state.film.id === "tt0137523", "the same film comes back without resetting");
+b.send({ type: "set", playing: true, time: back.state.time });
+await a.next((m) => m.type === "state" && m.action === "play");
 
 // An echo that matches the room's state must not produce a broadcast.
 a.send({ type: "set", playing: true, time: 0.5 });
@@ -68,4 +86,5 @@ ok(done.state.film === null && done.state.last.title === "Fight Club", "done emp
 
 a.ws.close();
 b.ws.close();
+cine2.ws.close();
 console.log("check passed");
